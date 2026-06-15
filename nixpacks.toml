@@ -1,5 +1,24 @@
 [phases.setup]
-nixPkgs = ["chromium", "chromedriver"]
+nixPkgs = [
+  "chromium",
+  "chromedriver",
+  "xvfb-run",
+  "glib",
+  "nss",
+  "nspr",
+  "atk",
+  "cups",
+  "dbus",
+  "expat",
+  "xorg.libX11",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "xorg.libxcb",
+  "mesa"
+]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]

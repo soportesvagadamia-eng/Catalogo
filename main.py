@@ -95,11 +95,53 @@ def extraer_modelo(producto: str) -> str:
 # ─── SCRAPING ─────────────────────────────────────────────────────────────────
 def init_driver():
     opts = Options()
-    opts.add_argument("--headless")
+    opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_argument("--remote-debugging-port=9222")
+
+    # Rutas posibles de chromium en Railway/Linux
+    chrome_paths = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/google-chrome",
+        "/nix/store",   # Railway nixpacks — se busca dinámicamente abajo
+    ]
+
+    # Buscar chromium en nix store si aplica
+    import glob, shutil
+    nix_chrome = glob.glob("/nix/store/*/bin/chromium")
+    nix_driver = glob.glob("/nix/store/*/bin/chromedriver")
+
+    chrome_bin = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+    driver_bin = shutil.which("chromedriver")
+
+    if not chrome_bin and nix_chrome:
+        chrome_bin = nix_chrome[0]
+    if not driver_bin and nix_driver:
+        driver_bin = nix_driver[0]
+
+    if chrome_bin:
+        log.info(f"Chrome binary: {chrome_bin}")
+        opts.binary_location = chrome_bin
+
+    if driver_bin:
+        log.info(f"ChromeDriver: {driver_bin}")
+        from selenium.webdriver.chrome.service import Service
+        return webdriver.Chrome(service=Service(driver_bin), options=opts)
+
+    # Fallback: webdriver-manager
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        from selenium.webdriver.chrome.service import Service
+        log.info("Usando webdriver-manager como fallback")
+        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+    except Exception as e:
+        log.warning(f"webdriver-manager falló: {e}")
+
     return webdriver.Chrome(options=opts)
 
 def login(driver):
@@ -356,7 +398,24 @@ def api_ordenes():
 
     return jsonify({"total": total, "page": page, "data": rows})
 
-@app.route("/api/sync", methods=["POST"])
+@app.route("/api/diagnostico")
+def api_diagnostico():
+    import glob, shutil
+    chrome_bin = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+    driver_bin = shutil.which("chromedriver")
+    nix_chrome = glob.glob("/nix/store/*/bin/chromium")
+    nix_driver = glob.glob("/nix/store/*/bin/chromedriver")
+    return jsonify({
+        "chrome_which": chrome_bin,
+        "driver_which": driver_bin,
+        "nix_chrome": nix_chrome[:3],
+        "nix_driver": nix_driver[:3],
+        "python": os.sys.version,
+        "db_exists": os.path.exists(DB_FILE),
+        "db_size_kb": round(os.path.getsize(DB_FILE)/1024, 1) if os.path.exists(DB_FILE) else 0,
+    })
+
+
 def api_sync_manual():
     thread = threading.Thread(target=sync, daemon=True)
     thread.start()
