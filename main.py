@@ -56,81 +56,37 @@ def scrape_con_playwright():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ]
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"]
         )
-        # Contexto con user-agent real para evitar detección de bot
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1280, "height": 800},
-            java_script_enabled=True,
-            ignore_https_errors=True,
         )
         page = context.new_page()
+        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
 
-        # Ocultar que es headless
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['es-EC', 'es'] });
-        """)
+        BASE = "https://catalogoelectronico.compraspublicas.gob.ec"
 
-        # Ir directo a la página de login
-        log.info("Cargando página de login...")
-        page.goto("https://catalogoelectronico.compraspublicas.gob.ec/entrar", timeout=30000, wait_until="domcontentloaded")
-        page.wait_for_timeout(2000)
-        log.info(f"URL login: {page.url}")
-        
-        # Llenar formulario
-        page.wait_for_selector("#ruc", timeout=10000)
+        # LOGIN directo vía formulario
+        log.info("Cargando /entrar ...")
+        page.goto(f"{BASE}/entrar", timeout=30000, wait_until="networkidle")
+        page.wait_for_selector("#ruc", timeout=15000)
         page.fill("#ruc", RUC)
         page.fill("#username", USUARIO)
         page.fill("#password", CLAVE)
-        
-        # Buscar botón Entrar
-        enter_selectors = [
-            "button:has-text('Entrar')",
-            "button:has-text('Ingresar')",
-            "button[type='submit']",
-            "input[type='submit']",
-        ]
-        for sel in enter_selectors:
-            try:
-                if page.locator(sel).count() > 0:
-                    page.locator(sel).first.click()
-                    break
-            except Exception:
-                continue
-
+        # El botón usa onclick="placeOrder()" — ejecutamos directo
+        page.evaluate("placeOrder()")
         page.wait_for_load_state("networkidle", timeout=20000)
         log.info(f"Login OK — URL: {page.url}")
 
+        def extraer_filas(url):
+            page.goto(url, timeout=30000, wait_until="networkidle")
+            page.wait_for_selector("#body_table_listas", timeout=20000)
+            return page.query_selector_all("#body_table_listas tr")
+
         # PENDIENTES
-        page.goto("https://catalogoelectronico.compraspublicas.gob.ec/pendientes", timeout=30000)
-        page.wait_for_timeout(3000)
-        
-        # Esperar tabla
-        try:
-            page.wait_for_selector("#body_table_listas", timeout=15000)
-        except Exception:
-            # Intentar con cualquier tabla
-            page.wait_for_selector("table", timeout=10000)
-            log.warning("Usando selector genérico 'table'")
-
-        page.screenshot(path="/tmp/debug_pendientes.png")
-        log.info(f"HTML pendientes (primeros 500 chars): {page.content()[:500]}")
-
-        filas = page.query_selector_all("#body_table_listas tr")
-        if not filas:
-            filas = page.query_selector_all("table tr")
-            log.warning(f"Usando filas genéricas: {len(filas)}")
-
-        log.info(f"Filas encontradas: {len(filas)}")
-
+        filas = extraer_filas(f"{BASE}/pendientes")
+        log.info(f"Filas pendientes: {len(filas)}")
         for fila in filas:
             cols = fila.query_selector_all("td")
             if len(cols) < 4: continue
@@ -147,15 +103,11 @@ def scrape_con_playwright():
                 "entidad": (cols[2].inner_text() or "").strip(),
                 "finalizacion": (cols[3].inner_text() or "").strip(),
             })
-
         log.info(f"Pendientes extraídos: {len(pendientes)}")
 
         # ASIGNADAS
         try:
-            page.goto("https://catalogoelectronico.compraspublicas.gob.ec/asignadas", timeout=30000)
-            page.wait_for_timeout(3000)
-            page.wait_for_selector("#body_table_listas", timeout=15000)
-            filas2 = page.query_selector_all("#body_table_listas tr")
+            filas2 = extraer_filas(f"{BASE}/asignadas")
             for fila in filas2:
                 cols = fila.query_selector_all("td")
                 if len(cols) < 4: continue
