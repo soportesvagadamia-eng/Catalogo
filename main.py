@@ -82,21 +82,25 @@ def iniciar_driver():
             opts.binary_location = path
             break
 
-    # Buscar chromedriver en la misma carpeta que el chromium encontrado
-    chrome_dir = os.path.dirname(opts.binary_location) if hasattr(opts, 'binary_location') and opts.binary_location else ""
-    driver_candidates = []
-    if chrome_dir:
-        driver_candidates.append(os.path.join(chrome_dir, "chromedriver"))
-    # Buscar en todas las carpetas de playwright
+    # Buscar chromedriver: apt instala en /usr/bin/chromedriver
+    driver_candidates = [
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+    ]
     driver_candidates += glob.glob("/ms-playwright/chromium-*/chrome-linux/chromedriver")
-    driver_candidates += glob.glob("/ms-playwright/chromium-*/chromedriver")
 
     for path in driver_candidates:
         if os.path.exists(path):
             log.info(f"Usando chromedriver: {path}")
             return webdriver.Chrome(service=Service(path), options=opts)
 
-    log.warning("No se encontró chromedriver compatible")
+    log.warning("Usando chromedriver del PATH")
+    import shutil
+    cd = shutil.which("chromedriver")
+    if cd:
+        log.info(f"chromedriver en PATH: {cd}")
+        return webdriver.Chrome(service=Service(cd), options=opts)
+
     return webdriver.Chrome(options=opts)
 
 # ─── SCRAPING — lógica IDÉNTICA al bot original ───────────────────────────────
