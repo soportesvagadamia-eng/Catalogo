@@ -79,45 +79,11 @@ def scrape_con_playwright():
             Object.defineProperty(navigator, 'languages', { get: () => ['es-EC', 'es'] });
         """)
 
-        log.info("Cargando página principal...")
-        page.goto("https://catalogoelectronico.compraspublicas.gob.ec/", timeout=30000, wait_until="domcontentloaded")
-        page.wait_for_timeout(3000)
-
-        # Tomar screenshot para debug
-        page.screenshot(path="/tmp/debug_home.png")
-        log.info(f"Título página: {page.title()}")
-        log.info(f"URL actual: {page.url}")
-
-        # Buscar el link de login de múltiples formas
-        login_selectors = [
-            "text=Iniciar sesión",
-            "text=Iniciar Sesión", 
-            "text=Login",
-            "text=Ingresar",
-            "a[href*='login']",
-            "a[href*='sesion']",
-            ".login",
-            "#login",
-        ]
-        
-        clicked = False
-        for sel in login_selectors:
-            try:
-                if page.locator(sel).count() > 0:
-                    log.info(f"Encontrado botón login con: {sel}")
-                    page.locator(sel).first.click()
-                    clicked = True
-                    break
-            except Exception:
-                continue
-
-        if not clicked:
-            # Último recurso: buscar todos los links y logear
-            links = page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => ({text: a.textContent.trim(), href: a.href}))")
-            log.info(f"Links encontrados: {links[:20]}")
-            raise Exception(f"No se encontró botón de login. Links: {links[:10]}")
-
+        # Ir directo a la página de login
+        log.info("Cargando página de login...")
+        page.goto("https://catalogoelectronico.compraspublicas.gob.ec/entrar", timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(2000)
+        log.info(f"URL login: {page.url}")
         
         # Llenar formulario
         page.wait_for_selector("#ruc", timeout=10000)
