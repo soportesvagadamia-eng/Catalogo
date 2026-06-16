@@ -66,41 +66,21 @@ def iniciar_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
 
-    import glob, shutil
-    # Prioridad: chromium de apt (/usr/bin/chromium) — compatible con /usr/bin/chromedriver
-    chromium_candidates = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-    ]
-    # Fallback: chromium de playwright
-    chromium_candidates += glob.glob("/ms-playwright/chromium-*/chrome-linux/chrome")
-
-    for path in chromium_candidates:
-        if os.path.exists(path):
-            log.info(f"Usando chromium: {path}")
-            opts.binary_location = path
-            break
-
-    # Buscar chromedriver: apt instala en /usr/bin/chromedriver
-    driver_candidates = [
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-    ]
-    driver_candidates += glob.glob("/ms-playwright/chromium-*/chrome-linux/chromedriver")
-
-    for path in driver_candidates:
-        if os.path.exists(path):
-            log.info(f"Usando chromedriver: {path}")
-            return webdriver.Chrome(service=Service(path), options=opts)
-
-    log.warning("Usando chromedriver del PATH")
+    # Usar SOLO chromium y chromedriver de apt — misma versión garantizada
     import shutil
-    cd = shutil.which("chromedriver")
-    if cd:
-        log.info(f"chromedriver en PATH: {cd}")
-        return webdriver.Chrome(service=Service(cd), options=opts)
 
-    return webdriver.Chrome(options=opts)
+    chrome_bin  = shutil.which("chromium") or shutil.which("chromium-browser")
+    driver_bin  = shutil.which("chromedriver")
+
+    log.info(f"chromium={chrome_bin}  chromedriver={driver_bin}")
+
+    if chrome_bin:
+        opts.binary_location = chrome_bin
+
+    if driver_bin:
+        return webdriver.Chrome(service=Service(driver_bin), options=opts)
+
+    raise RuntimeError("No se encontró chromium/chromedriver. Verificar Dockerfile.")
 
 # ─── SCRAPING — lógica IDÉNTICA al bot original ───────────────────────────────
 def iniciar_sesion(driver):
