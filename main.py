@@ -1,12 +1,6 @@
-import os, re, time, glob, shutil, sqlite3, threading, schedule, logging, subprocess
+import os, re, time, sqlite3, threading, schedule, logging
 from datetime import datetime
 from flask import Flask, jsonify, send_from_directory, request
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 RUC      = os.getenv("SERCOP_RUC",     "1000973329001")
@@ -19,36 +13,6 @@ INTERVAL = int(os.getenv("INTERVAL_H", "4"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("sercop")
 app = Flask(__name__, static_folder="static")
-
-# ─── INSTALAR CHROME AUTOMÁTICAMENTE ─────────────────────────────────────────
-def instalar_chrome():
-    """Intenta instalar chromium si no está disponible."""
-    if shutil.which("chromium") or shutil.which("chromium-browser"):
-        log.info("Chrome ya disponible")
-        return
-    log.info("Instalando chromium via apt...")
-    try:
-        subprocess.run(
-            ["apt-get", "install", "-y", "--no-install-recommends",
-             "chromium", "chromium-driver"],
-            check=True, capture_output=True, timeout=120
-        )
-        log.info("chromium instalado OK")
-    except Exception as e:
-        log.warning(f"apt-get falló: {e}")
-    # Intentar con playwright como último recurso
-    try:
-        subprocess.run(
-            ["pip", "install", "playwright", "-q"],
-            check=True, capture_output=True, timeout=60
-        )
-        subprocess.run(
-            ["playwright", "install", "chromium", "--with-deps"],
-            check=True, capture_output=True, timeout=180
-        )
-        log.info("Playwright chromium instalado OK")
-    except Exception as e:
-        log.warning(f"playwright falló: {e}")
 
 # ─── DB ───────────────────────────────────────────────────────────────────────
 def init_db():
@@ -87,149 +51,93 @@ def extraer_modelo(prod):
     m = re.search(r"MODELO\s+(\d+)", prod.upper())
     return f"MODELO {m.group(1)}" if m else "SIN MODELO"
 
-# ─── DRIVER ───────────────────────────────────────────────────────────────────
-def find_bin(*names):
-    for n in names:
-        p = shutil.which(n)
-        if p: return p
-    return None
+# ─── SCRAPING CON PLAYWRIGHT ──────────────────────────────────────────────────
+def scrape_con_playwright():
+    from playwright.sync_api import sync_playwright
+    pendientes = []
+    asignadas  = {}
 
-def get_chrome_paths():
-    chrome = find_bin("chromium", "chromium-browser", "google-chrome", "google-chrome-stable")
-    driver = find_bin("chromedriver", "chromium-driver", "chromium-chromedriver")
-    # Rutas fijas Debian/Ubuntu
-    for p in ["/usr/bin/chromium", "/usr/bin/chromium-browser",
-              "/usr/lib/chromium-browser/chromium-browser"]:
-        if not chrome and os.path.exists(p): chrome = p
-    for p in ["/usr/bin/chromedriver", "/usr/lib/chromium-browser/chromedriver",
-              "/usr/bin/chromium-driver"]:
-        if not driver and os.path.exists(p): driver = p
-    # Nix store
-    if not chrome:
-        hits = glob.glob("/nix/store/*/bin/chromium")
-        if hits: chrome = hits[0]
-    if not driver:
-        hits = glob.glob("/nix/store/*/bin/chromedriver")
-        if hits: driver = hits[0]
-    # Playwright
-    if not chrome:
-        hits = glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium*/chrome-linux/chrome"))
-        if hits: chrome = hits[0]
-    return chrome, driver
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"
+        ])
+        page = browser.new_page()
 
-def init_driver():
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
+        # LOGIN
+        log.info("Navegando al catálogo...")
+        page.goto("https://catalogoelectronico.compraspublicas.gob.ec/", timeout=30000)
+        page.click("text=Iniciar sesión")
+        page.wait_for_selector("#ruc", timeout=10000)
+        page.fill("#ruc", RUC)
+        page.fill("#username", USUARIO)
+        page.fill("#password", CLAVE)
+        page.click("button:has-text('Entrar')")
+        page.wait_for_load_state("networkidle", timeout=20000)
+        log.info("Login OK")
 
-    chrome_bin, driver_bin = get_chrome_paths()
-    log.info(f"chrome={chrome_bin}  driver={driver_bin}")
+        # PENDIENTES
+        page.goto("https://catalogoelectronico.compraspublicas.gob.ec/pendientes", timeout=30000)
+        page.wait_for_selector("#body_table_listas", timeout=20000)
+        page.wait_for_timeout(2000)
 
-    if chrome_bin:
-        opts.binary_location = chrome_bin
-
-    if driver_bin:
-        return webdriver.Chrome(service=Service(driver_bin), options=opts)
-
-    # webdriver-manager: descarga chromedriver compatible automáticamente
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        from webdriver_manager.core.os_manager import ChromeType
-        log.info("Probando webdriver-manager con chromium...")
-        svc = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
-        return webdriver.Chrome(service=svc, options=opts)
-    except Exception as e:
-        log.warning(f"webdriver-manager chromium: {e}")
-
-    try:
-        from webdriver_manager.chrome import ChromeDriverManager
-        log.info("Probando webdriver-manager con chrome...")
-        svc = Service(ChromeDriverManager().install())
-        return webdriver.Chrome(service=svc, options=opts)
-    except Exception as e:
-        log.warning(f"webdriver-manager chrome: {e}")
-
-    raise RuntimeError("No se encontró Chrome/Chromium. Ver /api/diagnostico")
-
-# ─── SCRAPING ─────────────────────────────────────────────────────────────────
-def login(driver):
-    driver.get("https://catalogoelectronico.compraspublicas.gob.ec/")
-    WebDriverWait(driver, 15).until(
-        EC.element_to_be_clickable((By.LINK_TEXT, "Iniciar sesión"))
-    ).click()
-    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "ruc"))).send_keys(RUC)
-    driver.find_element(By.ID, "username").send_keys(USUARIO)
-    driver.find_element(By.ID, "password").send_keys(CLAVE)
-    WebDriverWait(driver, 10).until(
-        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Entrar')]"))
-    ).click()
-    log.info("Login OK")
-
-def scrape_pendientes(driver):
-    driver.get("https://catalogoelectronico.compraspublicas.gob.ec/pendientes")
-    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.ID, "body_table_listas")))
-    time.sleep(2)
-    filas = driver.find_elements(By.CSS_SELECTOR, "#body_table_listas tr")
-    registros = []
-    for fila in filas:
-        cols = fila.find_elements(By.TAG_NAME, "td")
-        if len(cols) < 4: continue
-        producto = cols[0].text.strip().replace("\n", " ")
-        ce_match = re.search(r"CE-\d+", producto)
-        if not ce_match: continue
-        try:   qty = int(float(re.sub(r"[^\d.]", "", cols[1].text.strip())))
-        except: qty = 0
-        registros.append({
-            "ce": ce_match.group(0), "producto": producto,
-            "modelo": extraer_modelo(producto), "categoria": clasificar(producto),
-            "cantidad": qty, "entidad": cols[2].text.strip(),
-            "finalizacion": cols[3].text.strip(),
-        })
-    log.info(f"Pendientes: {len(registros)}")
-    return registros
-
-def scrape_asignadas(driver):
-    asignadas = {}
-    try:
-        driver.get("https://catalogoelectronico.compraspublicas.gob.ec/asignadas")
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.ID, "body_table_listas")))
-        time.sleep(2)
-        filas = driver.find_elements(By.CSS_SELECTOR, "#body_table_listas tr")
+        filas = page.query_selector_all("#body_table_listas tr")
+        log.info(f"Filas encontradas: {len(filas)}")
         for fila in filas:
-            cols = fila.find_elements(By.TAG_NAME, "td")
+            cols = fila.query_selector_all("td")
             if len(cols) < 4: continue
-            ce_match = re.search(r"CE-\d+", cols[0].text)
+            producto = (cols[0].inner_text() or "").strip().replace("\n", " ")
+            ce_match = re.search(r"CE-\d+", producto)
             if not ce_match: continue
             ce = ce_match.group(0)
-            canal = cols[4].text.strip() if len(cols) > 4 else ""
-            try:   precio = float(re.sub(r"[^\d.]", "", cols[5].text)) if len(cols) > 5 else None
-            except: precio = None
-            if canal: asignadas[ce] = {"canal": canal, "precio": precio}
-        log.info(f"Asignadas: {len(asignadas)}")
-    except Exception as e:
-        log.warning(f"scrape_asignadas: {e}")
-    return asignadas
+            try:   qty = int(float(re.sub(r"[^\d.]", "", cols[1].inner_text().strip())))
+            except: qty = 0
+            pendientes.append({
+                "ce": ce, "producto": producto,
+                "modelo": extraer_modelo(producto),
+                "categoria": clasificar(producto),
+                "cantidad": qty,
+                "entidad": (cols[2].inner_text() or "").strip(),
+                "finalizacion": (cols[3].inner_text() or "").strip(),
+            })
+
+        log.info(f"Pendientes: {len(pendientes)}")
+
+        # ASIGNADAS
+        try:
+            page.goto("https://catalogoelectronico.compraspublicas.gob.ec/asignadas", timeout=30000)
+            page.wait_for_selector("#body_table_listas", timeout=15000)
+            page.wait_for_timeout(2000)
+            filas2 = page.query_selector_all("#body_table_listas tr")
+            for fila in filas2:
+                cols = fila.query_selector_all("td")
+                if len(cols) < 4: continue
+                ce_match = re.search(r"CE-\d+", cols[0].inner_text())
+                if not ce_match: continue
+                ce = ce_match.group(0)
+                canal = cols[4].inner_text().strip() if len(cols) > 4 else ""
+                try:   precio = float(re.sub(r"[^\d.]", "", cols[5].inner_text())) if len(cols) > 5 else None
+                except: precio = None
+                if canal: asignadas[ce] = {"canal": canal, "precio": precio}
+            log.info(f"Asignadas: {len(asignadas)}")
+        except Exception as e:
+            log.warning(f"scrape_asignadas: {e}")
+
+        browser.close()
+
+    return pendientes, asignadas
 
 # ─── SYNC ─────────────────────────────────────────────────────────────────────
 def sync():
     inicio = datetime.now().isoformat(timespec="seconds")
     nuevas = actualizadas = 0
     error_msg = None
-    driver = None
     try:
         log.info("=== Iniciando sync ===")
-        driver = init_driver()
-        login(driver)
-        pendientes = scrape_pendientes(driver)
-        asignadas  = scrape_asignadas(driver)
+        pendientes, asignadas = scrape_con_playwright()
         ahora = datetime.now().isoformat(timespec="seconds")
         con = get_db(); cur = con.cursor()
         for r in pendientes:
-            extra = asignadas.get(r["ce"], {})
+            extra  = asignadas.get(r["ce"], {})
             canal  = extra.get("canal", "POR CONFIRMAR")
             precio = extra.get("precio")
             if cur.execute("SELECT ce FROM ordenes WHERE ce=?", (r["ce"],)).fetchone():
@@ -239,7 +147,8 @@ def sync():
                 actualizadas += 1
             else:
                 cur.execute("""INSERT INTO ordenes
-                    (ce,producto,modelo,categoria,cantidad,entidad,finalizacion,canal,precio,marca,primera_vez,ultima_vez)
+                    (ce,producto,modelo,categoria,cantidad,entidad,finalizacion,
+                     canal,precio,marca,primera_vez,ultima_vez)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (r["ce"],r["producto"],r["modelo"],r["categoria"],r["cantidad"],
                      r["entidad"],r["finalizacion"],canal,precio,"",ahora,ahora))
@@ -252,10 +161,6 @@ def sync():
     except Exception as e:
         error_msg = str(e)
         log.error(f"Error sync: {e}")
-    finally:
-        if driver:
-            try: driver.quit()
-            except: pass
     fin = datetime.now().isoformat(timespec="seconds")
     try:
         con = get_db()
@@ -281,9 +186,11 @@ def api_resumen():
         WHERE marca!='' AND marca IS NOT NULL GROUP BY marca ORDER BY unidades DESC LIMIT 10""").fetchall()]
     sync_row = con.execute("SELECT fin,nuevas,actualizadas,error FROM sync_log ORDER BY id DESC LIMIT 1").fetchone()
     con.close()
-    return jsonify({"resumen":{"total_ordenes":total,"total_unidades":unid,"confirmadas":asig,"sin_confirmar":total-asig},
-        "categorias":cats,"proveedores":provs,"marcas":marcas,
-        "ultimo_sync":dict(sync_row) if sync_row else {}})
+    return jsonify({
+        "resumen": {"total_ordenes":total,"total_unidades":unid,"confirmadas":asig,"sin_confirmar":total-asig},
+        "categorias":cats, "proveedores":provs, "marcas":marcas,
+        "ultimo_sync": dict(sync_row) if sync_row else {}
+    })
 
 @app.route("/api/ordenes")
 def api_ordenes():
@@ -291,7 +198,7 @@ def api_ordenes():
     q=request.args.get("q",""); page=int(request.args.get("page",1)); limit=100
     where,params=[],[]
     if cat: where.append("categoria=?"); params.append(cat)
-    if estado=="asignada":  where.append("canal NOT IN ('POR CONFIRMAR','')")
+    if estado=="asignada":   where.append("canal NOT IN ('POR CONFIRMAR','')")
     elif estado=="pendiente": where.append("canal IN ('POR CONFIRMAR','')")
     if q:
         where.append("(entidad LIKE ? OR ce LIKE ? OR canal LIKE ?)")
@@ -319,22 +226,28 @@ def api_sync_log():
 
 @app.route("/api/diagnostico")
 def api_diagnostico():
-    chrome, driver = get_chrome_paths()
-    sync_row = None
+    import glob, shutil
+    sync_row=None
     try:
         con=get_db()
         r=con.execute("SELECT * FROM sync_log ORDER BY id DESC LIMIT 1").fetchone()
         if r: sync_row=dict(r)
         con.close()
     except: pass
+    # Verificar playwright
+    pw_ok = False
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+            b.close()
+        pw_ok = True
+    except Exception as e:
+        pw_err = str(e)
     return jsonify({
-        "chrome_bin": chrome, "driver_bin": driver,
-        "apt_chromium":    os.path.exists("/usr/bin/chromium"),
-        "apt_chromedriver":os.path.exists("/usr/bin/chromedriver"),
-        "nix_chrome":  glob.glob("/nix/store/*/bin/chromium")[:2],
-        "playwright":  glob.glob(os.path.expanduser("~/.cache/ms-playwright/chromium*/chrome-linux/chrome"))[:2],
-        "db_exists":   os.path.exists(DB_FILE),
-        "db_size_kb":  round(os.path.getsize(DB_FILE)/1024,1) if os.path.exists(DB_FILE) else 0,
+        "playwright_ok": pw_ok,
+        "db_exists": os.path.exists(DB_FILE),
+        "db_size_kb": round(os.path.getsize(DB_FILE)/1024,1) if os.path.exists(DB_FILE) else 0,
         "ultimo_sync": sync_row,
     })
 
@@ -348,7 +261,6 @@ def run_scheduler():
     while True: schedule.run_pending(); time.sleep(30)
 
 if __name__=="__main__":
-    instalar_chrome()   # ← intenta instalar Chrome si no existe
     init_db()
     threading.Thread(target=sync, daemon=True).start()
     threading.Thread(target=run_scheduler, daemon=True).start()
