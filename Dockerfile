@@ -1,15 +1,19 @@
-FROM mcr.microsoft.com/playwright/python:v1.44.0-jammy
+FROM python:3.11-slim
 
 WORKDIR /app
 
-# Instalar chromium Y chromedriver del mismo paquete apt (versiones compatibles)
+# Instalar chromium y chromedriver desde apt (misma versión garantizada)
 RUN apt-get update && \
-    apt-get install -y chromium chromium-driver --no-install-recommends && \
-    echo "chromium: $(chromium --version)" && \
-    echo "chromedriver: $(chromedriver --version)"
+    apt-get install -y \
+        chromium \
+        chromium-driver \
+        --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/* && \
+    chromium --version && \
+    chromedriver --version
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
