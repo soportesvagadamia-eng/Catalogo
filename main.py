@@ -2,7 +2,6 @@ import os, re, time, sqlite3, threading, schedule, logging
 from datetime import datetime
 from flask import Flask, jsonify, send_from_directory, request
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
 RUC      = os.getenv("SERCOP_RUC",     "1000973329001")
 USUARIO  = os.getenv("SERCOP_USUARIO", "CARLINADAVILA")
 CLAVE    = os.getenv("SERCOP_CLAVE",   "Cdavila973329*")
@@ -14,7 +13,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("sercop")
 app = Flask(__name__, static_folder="static")
 
-# ─── DB ───────────────────────────────────────────────────────────────────────
 def init_db():
     con = sqlite3.connect(DB_FILE)
     con.executescript("""
@@ -35,7 +33,6 @@ def get_db():
     con.row_factory = sqlite3.Row
     return con
 
-# ─── CLASIFICAR ───────────────────────────────────────────────────────────────
 def clasificar(prod):
     p = prod.upper()
     if "IMPRESORA" in p or "PLOTTER" in p: return "IMPRESORAS"
@@ -51,48 +48,133 @@ def extraer_modelo(prod):
     m = re.search(r"MODELO\s+(\d+)", prod.upper())
     return f"MODELO {m.group(1)}" if m else "SIN MODELO"
 
-# ─── SCRAPING CON PLAYWRIGHT ──────────────────────────────────────────────────
 def scrape_con_playwright():
     from playwright.sync_api import sync_playwright
     pendientes = []
     asignadas  = {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=[
-            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"
-        ])
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled",
+            ]
+        )
+        # Contexto con user-agent real para evitar detección de bot
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800},
+            java_script_enabled=True,
+            ignore_https_errors=True,
+        )
+        page = context.new_page()
 
-        # LOGIN
-        log.info("Navegando al catálogo...")
-        page.goto("https://catalogoelectronico.compraspublicas.gob.ec/", timeout=30000)
-        page.click("text=Iniciar sesión")
+        # Ocultar que es headless
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['es-EC', 'es'] });
+        """)
+
+        log.info("Cargando página principal...")
+        page.goto("https://catalogoelectronico.compraspublicas.gob.ec/", timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+
+        # Tomar screenshot para debug
+        page.screenshot(path="/tmp/debug_home.png")
+        log.info(f"Título página: {page.title()}")
+        log.info(f"URL actual: {page.url}")
+
+        # Buscar el link de login de múltiples formas
+        login_selectors = [
+            "text=Iniciar sesión",
+            "text=Iniciar Sesión", 
+            "text=Login",
+            "text=Ingresar",
+            "a[href*='login']",
+            "a[href*='sesion']",
+            ".login",
+            "#login",
+        ]
+        
+        clicked = False
+        for sel in login_selectors:
+            try:
+                if page.locator(sel).count() > 0:
+                    log.info(f"Encontrado botón login con: {sel}")
+                    page.locator(sel).first.click()
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            # Último recurso: buscar todos los links y logear
+            links = page.evaluate("() => Array.from(document.querySelectorAll('a')).map(a => ({text: a.textContent.trim(), href: a.href}))")
+            log.info(f"Links encontrados: {links[:20]}")
+            raise Exception(f"No se encontró botón de login. Links: {links[:10]}")
+
+        page.wait_for_timeout(2000)
+        
+        # Llenar formulario
         page.wait_for_selector("#ruc", timeout=10000)
         page.fill("#ruc", RUC)
         page.fill("#username", USUARIO)
         page.fill("#password", CLAVE)
-        page.click("button:has-text('Entrar')")
+        
+        # Buscar botón Entrar
+        enter_selectors = [
+            "button:has-text('Entrar')",
+            "button:has-text('Ingresar')",
+            "button[type='submit']",
+            "input[type='submit']",
+        ]
+        for sel in enter_selectors:
+            try:
+                if page.locator(sel).count() > 0:
+                    page.locator(sel).first.click()
+                    break
+            except Exception:
+                continue
+
         page.wait_for_load_state("networkidle", timeout=20000)
-        log.info("Login OK")
+        log.info(f"Login OK — URL: {page.url}")
 
         # PENDIENTES
         page.goto("https://catalogoelectronico.compraspublicas.gob.ec/pendientes", timeout=30000)
-        page.wait_for_selector("#body_table_listas", timeout=20000)
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(3000)
+        
+        # Esperar tabla
+        try:
+            page.wait_for_selector("#body_table_listas", timeout=15000)
+        except Exception:
+            # Intentar con cualquier tabla
+            page.wait_for_selector("table", timeout=10000)
+            log.warning("Usando selector genérico 'table'")
+
+        page.screenshot(path="/tmp/debug_pendientes.png")
+        log.info(f"HTML pendientes (primeros 500 chars): {page.content()[:500]}")
 
         filas = page.query_selector_all("#body_table_listas tr")
+        if not filas:
+            filas = page.query_selector_all("table tr")
+            log.warning(f"Usando filas genéricas: {len(filas)}")
+
         log.info(f"Filas encontradas: {len(filas)}")
+
         for fila in filas:
             cols = fila.query_selector_all("td")
             if len(cols) < 4: continue
             producto = (cols[0].inner_text() or "").strip().replace("\n", " ")
             ce_match = re.search(r"CE-\d+", producto)
             if not ce_match: continue
-            ce = ce_match.group(0)
             try:   qty = int(float(re.sub(r"[^\d.]", "", cols[1].inner_text().strip())))
             except: qty = 0
             pendientes.append({
-                "ce": ce, "producto": producto,
+                "ce": ce_match.group(0), "producto": producto,
                 "modelo": extraer_modelo(producto),
                 "categoria": clasificar(producto),
                 "cantidad": qty,
@@ -100,13 +182,13 @@ def scrape_con_playwright():
                 "finalizacion": (cols[3].inner_text() or "").strip(),
             })
 
-        log.info(f"Pendientes: {len(pendientes)}")
+        log.info(f"Pendientes extraídos: {len(pendientes)}")
 
         # ASIGNADAS
         try:
             page.goto("https://catalogoelectronico.compraspublicas.gob.ec/asignadas", timeout=30000)
+            page.wait_for_timeout(3000)
             page.wait_for_selector("#body_table_listas", timeout=15000)
-            page.wait_for_timeout(2000)
             filas2 = page.query_selector_all("#body_table_listas tr")
             for fila in filas2:
                 cols = fila.query_selector_all("td")
@@ -122,11 +204,11 @@ def scrape_con_playwright():
         except Exception as e:
             log.warning(f"scrape_asignadas: {e}")
 
+        context.close()
         browser.close()
 
     return pendientes, asignadas
 
-# ─── SYNC ─────────────────────────────────────────────────────────────────────
 def sync():
     inicio = datetime.now().isoformat(timespec="seconds")
     nuevas = actualizadas = 0
@@ -169,7 +251,6 @@ def sync():
         con.commit(); con.close()
     except: pass
 
-# ─── API ──────────────────────────────────────────────────────────────────────
 @app.route("/api/resumen")
 def api_resumen():
     con = get_db()
@@ -188,7 +269,7 @@ def api_resumen():
     con.close()
     return jsonify({
         "resumen": {"total_ordenes":total,"total_unidades":unid,"confirmadas":asig,"sin_confirmar":total-asig},
-        "categorias":cats, "proveedores":provs, "marcas":marcas,
+        "categorias":cats,"proveedores":provs,"marcas":marcas,
         "ultimo_sync": dict(sync_row) if sync_row else {}
     })
 
@@ -226,7 +307,6 @@ def api_sync_log():
 
 @app.route("/api/diagnostico")
 def api_diagnostico():
-    import glob, shutil
     sync_row=None
     try:
         con=get_db()
@@ -234,28 +314,25 @@ def api_diagnostico():
         if r: sync_row=dict(r)
         con.close()
     except: pass
-    # Verificar playwright
-    pw_ok = False
+    pw_ok=False
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as p:
-            b = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+            b=p.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage"])
             b.close()
-        pw_ok = True
-    except Exception as e:
-        pw_err = str(e)
+        pw_ok=True
+    except: pass
     return jsonify({
-        "playwright_ok": pw_ok,
-        "db_exists": os.path.exists(DB_FILE),
-        "db_size_kb": round(os.path.getsize(DB_FILE)/1024,1) if os.path.exists(DB_FILE) else 0,
-        "ultimo_sync": sync_row,
+        "playwright_ok":pw_ok,
+        "db_exists":os.path.exists(DB_FILE),
+        "db_size_kb":round(os.path.getsize(DB_FILE)/1024,1) if os.path.exists(DB_FILE) else 0,
+        "ultimo_sync":sync_row,
     })
 
 @app.route("/")
 def index():
     return send_from_directory("static","index.html")
 
-# ─── SCHEDULER ────────────────────────────────────────────────────────────────
 def run_scheduler():
     schedule.every(INTERVAL).hours.do(sync)
     while True: schedule.run_pending(); time.sleep(30)
