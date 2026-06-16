@@ -50,87 +50,80 @@ def extraer_modelo(prod):
 
 def scrape_con_playwright():
     from playwright.sync_api import sync_playwright
+    from bs4 import BeautifulSoup
+    import requests
+
+    BASE = "https://catalogoelectronico.compraspublicas.gob.ec"
+    UA   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
     pendientes = []
     asignadas  = {}
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800},
-        )
-        page = context.new_page()
-        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    # ── LOGIN vía requests (sin browser) ─────────────────────────────────────
+    session = requests.Session()
+    session.headers.update({"User-Agent": UA, "Referer": f"{BASE}/entrar"})
 
-        BASE = "https://catalogoelectronico.compraspublicas.gob.ec"
+    # Obtener cookies/CSRF de la página de login
+    r = session.get(f"{BASE}/entrar", timeout=20)
+    log.info(f"GET /entrar status: {r.status_code}")
 
-        # LOGIN directo vía formulario
-        log.info("Cargando /entrar ...")
-        page.goto(f"{BASE}/entrar", timeout=30000, wait_until="networkidle")
-        page.wait_for_selector("#ruc", timeout=15000)
-        page.fill("#ruc", RUC)
-        page.fill("#username", USUARIO)
-        page.fill("#password", CLAVE)
-        # El botón usa onclick="placeOrder()" — ejecutamos directo
-        page.evaluate("placeOrder()")
-        page.wait_for_load_state("networkidle", timeout=20000)
-        log.info(f"Post-login URL: {page.url}")
-        log.info(f"Post-login title: {page.title()}")
-        # Si sigue en /entrar, login falló
-        if "/entrar" in page.url or "/login" in page.url:
-            html = page.content()
-            log.error(f"Login FALLÓ. HTML (500 chars): {html[:500]}")
-            raise Exception(f"Login falló — sigue en {page.url}")
-        log.info("Login OK")
+    # Enviar formulario de login
+    payload = {"_ruc": RUC, "_username": USUARIO, "_password": CLAVE}
+    r2 = session.post(f"{BASE}/login_check", data=payload, timeout=20, allow_redirects=True)
+    log.info(f"POST /login_check status: {r2.status_code} url: {r2.url}")
 
-        def extraer_filas(url):
-            page.goto(url, timeout=30000, wait_until="networkidle")
-            page.wait_for_selector("#body_table_listas", timeout=20000)
-            return page.query_selector_all("#body_table_listas tr")
+    if "/entrar" in r2.url or "/login" in r2.url:
+        raise Exception(f"Login falló — redirigió a {r2.url}")
+    log.info("Login OK via requests")
 
-        # PENDIENTES
-        filas = extraer_filas(f"{BASE}/pendientes")
-        log.info(f"Filas pendientes: {len(filas)}")
-        for fila in filas:
-            cols = fila.query_selector_all("td")
+    # ── SCRAPING vía requests + BeautifulSoup ────────────────────────────────
+    def extraer_tabla(url):
+        r = session.get(url, timeout=20)
+        log.info(f"GET {url} status: {r.status_code}")
+        soup = BeautifulSoup(r.text, "html.parser")
+        tabla = soup.find("tbody", id="body_table_listas")
+        if not tabla:
+            tabla = soup.find("table")
+            log.warning("Usando tabla genérica")
+        return tabla.find_all("tr") if tabla else []
+
+    # PENDIENTES
+    filas = extraer_tabla(f"{BASE}/pendientes")
+    log.info(f"Filas pendientes: {len(filas)}")
+    for fila in filas:
+        cols = fila.find_all("td")
+        if len(cols) < 4: continue
+        producto = cols[0].get_text(" ", strip=True)
+        ce_match = re.search(r"CE-\d+", producto)
+        if not ce_match: continue
+        try:   qty = int(float(re.sub(r"[^\d.]", "", cols[1].get_text(strip=True))))
+        except: qty = 0
+        pendientes.append({
+            "ce": ce_match.group(0), "producto": producto,
+            "modelo": extraer_modelo(producto),
+            "categoria": clasificar(producto),
+            "cantidad": qty,
+            "entidad": cols[2].get_text(strip=True),
+            "finalizacion": cols[3].get_text(strip=True),
+        })
+    log.info(f"Pendientes extraídos: {len(pendientes)}")
+
+    # ASIGNADAS
+    try:
+        filas2 = extraer_tabla(f"{BASE}/asignadas")
+        for fila in filas2:
+            cols = fila.find_all("td")
             if len(cols) < 4: continue
-            producto = (cols[0].inner_text() or "").strip().replace("\n", " ")
-            ce_match = re.search(r"CE-\d+", producto)
+            ce_match = re.search(r"CE-\d+", cols[0].get_text())
             if not ce_match: continue
-            try:   qty = int(float(re.sub(r"[^\d.]", "", cols[1].inner_text().strip())))
-            except: qty = 0
-            pendientes.append({
-                "ce": ce_match.group(0), "producto": producto,
-                "modelo": extraer_modelo(producto),
-                "categoria": clasificar(producto),
-                "cantidad": qty,
-                "entidad": (cols[2].inner_text() or "").strip(),
-                "finalizacion": (cols[3].inner_text() or "").strip(),
-            })
-        log.info(f"Pendientes extraídos: {len(pendientes)}")
-
-        # ASIGNADAS
-        try:
-            filas2 = extraer_filas(f"{BASE}/asignadas")
-            for fila in filas2:
-                cols = fila.query_selector_all("td")
-                if len(cols) < 4: continue
-                ce_match = re.search(r"CE-\d+", cols[0].inner_text())
-                if not ce_match: continue
-                ce = ce_match.group(0)
-                canal = cols[4].inner_text().strip() if len(cols) > 4 else ""
-                try:   precio = float(re.sub(r"[^\d.]", "", cols[5].inner_text())) if len(cols) > 5 else None
-                except: precio = None
-                if canal: asignadas[ce] = {"canal": canal, "precio": precio}
-            log.info(f"Asignadas: {len(asignadas)}")
-        except Exception as e:
-            log.warning(f"scrape_asignadas: {e}")
-
-        context.close()
-        browser.close()
+            ce = ce_match.group(0)
+            canal = cols[4].get_text(strip=True) if len(cols) > 4 else ""
+            try:   precio = float(re.sub(r"[^\d.]", "", cols[5].get_text())) if len(cols) > 5 else None
+            except: precio = None
+            if canal: asignadas[ce] = {"canal": canal, "precio": precio}
+        log.info(f"Asignadas: {len(asignadas)}")
+    except Exception as e:
+        log.warning(f"scrape_asignadas: {e}")
 
     return pendientes, asignadas
 
