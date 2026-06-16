@@ -63,12 +63,29 @@ def scrape_con_playwright():
     session = requests.Session()
     session.headers.update({"User-Agent": UA, "Referer": f"{BASE}/entrar"})
 
-    # Obtener cookies/CSRF de la página de login
+    from bs4 import BeautifulSoup as BS4
+
+    # Obtener página de login y extraer token CSRF
     r = session.get(f"{BASE}/entrar", timeout=20)
     log.info(f"GET /entrar status: {r.status_code}")
+    soup0 = BS4(r.text, "html.parser")
 
-    # Enviar formulario de login
+    # Buscar token CSRF en el formulario
+    csrf_token = None
+    for inp in soup0.find_all("input", {"type": "hidden"}):
+        log.info(f"Hidden input: name={inp.get('name')} value={inp.get('value','')[:30]}")
+        if "_token" in (inp.get("name") or "") or "csrf" in (inp.get("name") or "").lower():
+            csrf_token = inp.get("value")
+            log.info(f"CSRF token encontrado: {inp.get('name')} = {csrf_token[:20] if csrf_token else None}")
+
+    # Enviar formulario con todos los campos incluyendo CSRF
     payload = {"_ruc": RUC, "_username": USUARIO, "_password": CLAVE}
+    if csrf_token:
+        # Agregar token con el nombre correcto
+        for inp in soup0.find_all("input", {"type": "hidden"}):
+            payload[inp.get("name")] = inp.get("value", "")
+
+    log.info(f"Payload keys: {list(payload.keys())}")
     r2 = session.post(f"{BASE}/login_check", data=payload, timeout=20, allow_redirects=True)
     log.info(f"POST /login_check status: {r2.status_code} url: {r2.url}")
 
