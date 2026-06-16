@@ -77,7 +77,14 @@ def scrape_con_playwright():
         # El botón usa onclick="placeOrder()" — ejecutamos directo
         page.evaluate("placeOrder()")
         page.wait_for_load_state("networkidle", timeout=20000)
-        log.info(f"Login OK — URL: {page.url}")
+        log.info(f"Post-login URL: {page.url}")
+        log.info(f"Post-login title: {page.title()}")
+        # Si sigue en /entrar, login falló
+        if "/entrar" in page.url or "/login" in page.url:
+            html = page.content()
+            log.error(f"Login FALLÓ. HTML (500 chars): {html[:500]}")
+            raise Exception(f"Login falló — sigue en {page.url}")
+        log.info("Login OK")
 
         def extraer_filas(url):
             page.goto(url, timeout=30000, wait_until="networkidle")
