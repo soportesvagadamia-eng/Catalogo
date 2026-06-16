@@ -66,17 +66,16 @@ def iniciar_driver():
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
 
-    # Chromium de la imagen playwright (ubicación fija)
-    chromium_paths = [
-        "/ms-playwright/chromium-1124/chrome-linux/chrome",
-        "/ms-playwright/chromium/chrome-linux/chrome",
+    import glob, shutil
+    # Prioridad: chromium de apt (/usr/bin/chromium) — compatible con /usr/bin/chromedriver
+    chromium_candidates = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
     ]
-    import glob
-    hits = glob.glob("/ms-playwright/chromium-*/chrome-linux/chrome")
-    if hits:
-        chromium_paths = hits + chromium_paths
+    # Fallback: chromium de playwright
+    chromium_candidates += glob.glob("/ms-playwright/chromium-*/chrome-linux/chrome")
 
-    for path in chromium_paths:
+    for path in chromium_candidates:
         if os.path.exists(path):
             log.info(f"Usando chromium: {path}")
             opts.binary_location = path
