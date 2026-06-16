@@ -68,7 +68,8 @@ def iniciar_driver():
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-setuid-sandbox")
     opts.add_argument("--window-size=1280,720")
-    opts.add_argument("--shm-size=128m")
+    opts.add_argument("--memory-pressure-off")
+    opts.add_argument("--max_old_space_size=512")
 
     # Usar SOLO chromium y chromedriver de apt — misma versión garantizada
     import shutil
