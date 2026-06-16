@@ -60,11 +60,15 @@ def extraer_modelo(prod):
 # ─── DRIVER — igual que el bot original pero headless ─────────────────────────
 def iniciar_driver():
     opts = Options()
-    opts.add_argument("--headless=new")
+    opts.add_argument("--headless")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-setuid-sandbox")
+    opts.add_argument("--window-size=1280,720")
+    opts.add_argument("--shm-size=128m")
 
     # Usar SOLO chromium y chromedriver de apt — misma versión garantizada
     import shutil

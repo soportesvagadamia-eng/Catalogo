@@ -2,7 +2,6 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Instalar chromium y chromedriver desde apt (misma versión garantizada)
 RUN apt-get update && \
     apt-get install -y \
         chromium \
@@ -18,4 +17,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8080
+
+# Aumentar shared memory para chromium
 CMD ["python", "main.py"]
