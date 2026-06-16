@@ -2,4 +2,4 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "playwright install chromium --with-deps && python main.py"
+startCommand = "playwright install chromium && python main.py"
