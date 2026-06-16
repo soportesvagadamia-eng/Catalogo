@@ -1,7 +1,14 @@
 import os, re, time, sqlite3, threading, schedule, logging
 from datetime import datetime
 from flask import Flask, jsonify, send_from_directory, request
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
 RUC      = os.getenv("SERCOP_RUC",     "1000973329001")
 USUARIO  = os.getenv("SERCOP_USUARIO", "CARLINADAVILA")
 CLAVE    = os.getenv("SERCOP_CLAVE",   "Cdavila973329*")
@@ -13,6 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("sercop")
 app = Flask(__name__, static_folder="static")
 
+# ─── DB ───────────────────────────────────────────────────────────────────────
 def init_db():
     con = sqlite3.connect(DB_FILE)
     con.executescript("""
@@ -33,6 +41,7 @@ def get_db():
     con.row_factory = sqlite3.Row
     return con
 
+# ─── CLASIFICAR ───────────────────────────────────────────────────────────────
 def clasificar(prod):
     p = prod.upper()
     if "IMPRESORA" in p or "PLOTTER" in p: return "IMPRESORAS"
@@ -48,109 +57,127 @@ def extraer_modelo(prod):
     m = re.search(r"MODELO\s+(\d+)", prod.upper())
     return f"MODELO {m.group(1)}" if m else "SIN MODELO"
 
-def scrape_con_playwright():
-    from playwright.sync_api import sync_playwright
-    from bs4 import BeautifulSoup
-    import requests
+# ─── DRIVER — igual que el bot original pero headless ─────────────────────────
+def iniciar_driver():
+    opts = Options()
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--window-size=1920,1080")
 
-    BASE = "https://catalogoelectronico.compraspublicas.gob.ec"
-    UA   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    # Chromium de la imagen playwright (ubicación fija)
+    chromium_paths = [
+        "/ms-playwright/chromium-1124/chrome-linux/chrome",
+        "/ms-playwright/chromium/chrome-linux/chrome",
+    ]
+    import glob
+    hits = glob.glob("/ms-playwright/chromium-*/chrome-linux/chrome")
+    if hits:
+        chromium_paths = hits + chromium_paths
 
-    pendientes = []
-    asignadas  = {}
+    for path in chromium_paths:
+        if os.path.exists(path):
+            log.info(f"Usando chromium: {path}")
+            opts.binary_location = path
+            break
 
-    # ── LOGIN vía requests (sin browser) ─────────────────────────────────────
-    session = requests.Session()
-    session.headers.update({"User-Agent": UA, "Referer": f"{BASE}/entrar"})
+    # chromedriver de la imagen playwright
+    driver_paths = ["/ms-playwright/chromium-1124/chrome-linux/chromedriver"]
+    hits2 = glob.glob("/ms-playwright/chromium-*/chrome-linux/chromedriver")
+    if hits2:
+        driver_paths = hits2 + driver_paths
 
-    from bs4 import BeautifulSoup as BS4
+    for path in driver_paths:
+        if os.path.exists(path):
+            log.info(f"Usando chromedriver: {path}")
+            return webdriver.Chrome(service=Service(path), options=opts)
 
-    # Obtener página de login y extraer token CSRF
-    r = session.get(f"{BASE}/entrar", timeout=20)
-    log.info(f"GET /entrar status: {r.status_code}")
-    soup0 = BS4(r.text, "html.parser")
+    # Fallback: chromedriver del sistema
+    log.warning("Usando chromedriver del sistema")
+    return webdriver.Chrome(options=opts)
 
-    # Buscar token CSRF en el formulario
-    csrf_token = None
-    for inp in soup0.find_all("input", {"type": "hidden"}):
-        log.info(f"Hidden input: name={inp.get('name')} value={inp.get('value','')[:30]}")
-        if "_token" in (inp.get("name") or "") or "csrf" in (inp.get("name") or "").lower():
-            csrf_token = inp.get("value")
-            log.info(f"CSRF token encontrado: {inp.get('name')} = {csrf_token[:20] if csrf_token else None}")
+# ─── SCRAPING — lógica IDÉNTICA al bot original ───────────────────────────────
+def iniciar_sesion(driver):
+    driver.get("https://catalogoelectronico.compraspublicas.gob.ec/")
+    WebDriverWait(driver, 15).until(
+        EC.element_to_be_clickable((By.LINK_TEXT, "Iniciar sesión"))
+    ).click()
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.ID, "ruc"))
+    ).send_keys(RUC)
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.ID, "username"))
+    ).send_keys(USUARIO)
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.ID, "password"))
+    ).send_keys(CLAVE)
+    WebDriverWait(driver, 10).until(
+        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Entrar')]"))
+    ).click()
+    log.info("Login OK")
+    driver.get("https://catalogoelectronico.compraspublicas.gob.ec/pendientes")
+    WebDriverWait(driver, 20).until(
+        EC.presence_of_element_located((By.ID, "body_table_listas"))
+    )
 
-    # Enviar formulario con todos los campos incluyendo CSRF
-    payload = {"_ruc": RUC, "_username": USUARIO, "_password": CLAVE}
-    if csrf_token:
-        # Agregar token con el nombre correcto
-        for inp in soup0.find_all("input", {"type": "hidden"}):
-            payload[inp.get("name")] = inp.get("value", "")
-
-    log.info(f"Payload keys: {list(payload.keys())}")
-    r2 = session.post(f"{BASE}/login_check", data=payload, timeout=20, allow_redirects=True)
-    log.info(f"POST /login_check status: {r2.status_code} url: {r2.url}")
-
-    if "/entrar" in r2.url or "/login" in r2.url:
-        raise Exception(f"Login falló — redirigió a {r2.url}")
-    log.info("Login OK via requests")
-
-    # ── SCRAPING vía requests + BeautifulSoup ────────────────────────────────
-    def extraer_tabla(url):
-        r = session.get(url, timeout=20)
-        log.info(f"GET {url} status: {r.status_code}")
-        soup = BeautifulSoup(r.text, "html.parser")
-        tabla = soup.find("tbody", id="body_table_listas")
-        if not tabla:
-            tabla = soup.find("table")
-            log.warning("Usando tabla genérica")
-        return tabla.find_all("tr") if tabla else []
-
-    # PENDIENTES
-    filas = extraer_tabla(f"{BASE}/pendientes")
-    log.info(f"Filas pendientes: {len(filas)}")
-    for fila in filas:
-        cols = fila.find_all("td")
+def scrape_pendientes(driver):
+    filas = driver.find_elements(By.CSS_SELECTOR, "#body_table_listas tr")
+    log.info(f"Filas encontradas: {len(filas)}")
+    registros = []
+    for fila in reversed(filas):
+        cols = fila.find_elements(By.TAG_NAME, "td")
         if len(cols) < 4: continue
-        producto = cols[0].get_text(" ", strip=True)
+        producto = cols[0].text.strip().replace('\n', ' ')
         ce_match = re.search(r"CE-\d+", producto)
         if not ce_match: continue
-        try:   qty = int(float(re.sub(r"[^\d.]", "", cols[1].get_text(strip=True))))
+        try:   qty = int(float(re.sub(r"[^\d.]", "", cols[1].text.strip())))
         except: qty = 0
-        pendientes.append({
+        registros.append({
             "ce": ce_match.group(0), "producto": producto,
             "modelo": extraer_modelo(producto),
             "categoria": clasificar(producto),
             "cantidad": qty,
-            "entidad": cols[2].get_text(strip=True),
-            "finalizacion": cols[3].get_text(strip=True),
+            "entidad": cols[2].text.strip(),
+            "finalizacion": cols[3].text.strip(),
         })
-    log.info(f"Pendientes extraídos: {len(pendientes)}")
+    return registros
 
-    # ASIGNADAS
+def scrape_asignadas(driver):
+    asignadas = {}
     try:
-        filas2 = extraer_tabla(f"{BASE}/asignadas")
-        for fila in filas2:
-            cols = fila.find_all("td")
+        driver.get("https://catalogoelectronico.compraspublicas.gob.ec/asignadas")
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.ID, "body_table_listas"))
+        )
+        filas = driver.find_elements(By.CSS_SELECTOR, "#body_table_listas tr")
+        for fila in filas:
+            cols = fila.find_elements(By.TAG_NAME, "td")
             if len(cols) < 4: continue
-            ce_match = re.search(r"CE-\d+", cols[0].get_text())
+            ce_match = re.search(r"CE-\d+", cols[0].text)
             if not ce_match: continue
-            ce = ce_match.group(0)
-            canal = cols[4].get_text(strip=True) if len(cols) > 4 else ""
-            try:   precio = float(re.sub(r"[^\d.]", "", cols[5].get_text())) if len(cols) > 5 else None
+            ce    = ce_match.group(0)
+            canal = cols[4].text.strip() if len(cols) > 4 else ""
+            try:   precio = float(re.sub(r"[^\d.]", "", cols[5].text)) if len(cols) > 5 else None
             except: precio = None
             if canal: asignadas[ce] = {"canal": canal, "precio": precio}
         log.info(f"Asignadas: {len(asignadas)}")
     except Exception as e:
         log.warning(f"scrape_asignadas: {e}")
+    return asignadas
 
-    return pendientes, asignadas
-
+# ─── SYNC ─────────────────────────────────────────────────────────────────────
 def sync():
     inicio = datetime.now().isoformat(timespec="seconds")
     nuevas = actualizadas = 0
     error_msg = None
+    driver = None
     try:
         log.info("=== Iniciando sync ===")
-        pendientes, asignadas = scrape_con_playwright()
+        driver = iniciar_driver()
+        iniciar_sesion(driver)
+        pendientes = scrape_pendientes(driver)
+        asignadas  = scrape_asignadas(driver)
         ahora = datetime.now().isoformat(timespec="seconds")
         con = get_db(); cur = con.cursor()
         for r in pendientes:
@@ -178,6 +205,10 @@ def sync():
     except Exception as e:
         error_msg = str(e)
         log.error(f"Error sync: {e}")
+    finally:
+        if driver:
+            try: driver.quit()
+            except: pass
     fin = datetime.now().isoformat(timespec="seconds")
     try:
         con = get_db()
@@ -186,6 +217,7 @@ def sync():
         con.commit(); con.close()
     except: pass
 
+# ─── API ──────────────────────────────────────────────────────────────────────
 @app.route("/api/resumen")
 def api_resumen():
     con = get_db()
@@ -242,6 +274,9 @@ def api_sync_log():
 
 @app.route("/api/diagnostico")
 def api_diagnostico():
+    import glob
+    hits = glob.glob("/ms-playwright/chromium-*/chrome-linux/chrome")
+    hits2 = glob.glob("/ms-playwright/chromium-*/chrome-linux/chromedriver")
     sync_row=None
     try:
         con=get_db()
@@ -249,19 +284,12 @@ def api_diagnostico():
         if r: sync_row=dict(r)
         con.close()
     except: pass
-    pw_ok=False
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            b=p.chromium.launch(headless=True,args=["--no-sandbox","--disable-dev-shm-usage"])
-            b.close()
-        pw_ok=True
-    except: pass
     return jsonify({
-        "playwright_ok":pw_ok,
-        "db_exists":os.path.exists(DB_FILE),
-        "db_size_kb":round(os.path.getsize(DB_FILE)/1024,1) if os.path.exists(DB_FILE) else 0,
-        "ultimo_sync":sync_row,
+        "chromium_paths": hits,
+        "chromedriver_paths": hits2,
+        "db_exists": os.path.exists(DB_FILE),
+        "db_size_kb": round(os.path.getsize(DB_FILE)/1024,1) if os.path.exists(DB_FILE) else 0,
+        "ultimo_sync": sync_row,
     })
 
 @app.route("/")
